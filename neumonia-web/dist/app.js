@@ -10,6 +10,12 @@
   const previewImage = byId('preview-image');
   const previewName = byId('preview-name');
   const previewDetails = byId('preview-details');
+  const originalView = byId('view-original');
+  const heatmapView = byId('view-heatmap');
+  const heatmapLayer = byId('heatmap-layer');
+  const heatmapLegend = byId('heatmap-legend');
+  const heatmapCaption = byId('heatmap-caption');
+  const heatmapNote = byId('heatmap-note');
   const resetButton = byId('reset-button');
   const replaceButton = byId('replace-button');
   const analyzeButton = byId('analyze-button');
@@ -24,8 +30,23 @@
   const resultMeter = byId('result-meter');
   const resultMessage = byId('result-message');
   const modeLabel = byId('mode-label');
+  const workspace = document.querySelector('.workspace-grid');
+  const sourceFile = byId('source-file');
+  const viewerIdle = byId('viewer-idle');
+  const mobileViewer = byId('mobile-viewer');
+  const mobileResult = byId('mobile-result');
+  const mobileLayout = window.matchMedia('(max-width: 760px)');
+
+  function showWorkspaceView(view, focusTarget) {
+    workspace.dataset.view = view;
+    mobileViewer.setAttribute('aria-pressed', String(view === 'viewer'));
+    mobileResult.setAttribute('aria-pressed', String(view === 'result'));
+    if (focusTarget && mobileLayout.matches) focusTarget.focus({ preventScroll: true });
+  }
 
   const maxFileBytes = 10 * 1024 * 1024;
+  const maxHeatmapSide = 1024;
+  const heatmapColors = [[65, 37, 149], [161, 42, 192], [239, 85, 62], [255, 220, 84]];
   const numberFormat = new Intl.NumberFormat('es-MX', { maximumFractionDigits: 1 });
   const percentFormat = new Intl.NumberFormat('es-MX', {
     style: 'percent', maximumFractionDigits: 1,
@@ -75,6 +96,7 @@
   }
 
   function setResultState(state) {
+    if (state !== 'output') resetHeatmap();
     resultEmpty.hidden = state !== 'empty';
     resultLoading.hidden = state !== 'loading';
     resultOutput.hidden = state !== 'output';
@@ -84,6 +106,8 @@
   function updateControls() {
     const choosingFile = document.activeElement === dropZone;
     uploadIdle.hidden = Boolean(selection);
+    sourceFile.hidden = !selection;
+    viewerIdle.hidden = Boolean(selection);
     preview.hidden = !selection;
     analyzeButton.disabled = loadingImage || Boolean(activeRequest)
       || !selection || (!selection.result && !endpoint);
@@ -211,6 +235,96 @@
       && Number.isFinite(result.score) && result.score >= 0 && result.score <= 1;
   }
 
+  function validHeatmap(map) {
+    return map && Number.isInteger(map.width) && Number.isInteger(map.height)
+      && map.width > 0 && map.width <= maxHeatmapSide
+      && map.height > 0 && map.height <= maxHeatmapSide
+      && Array.isArray(map.values) && map.values.length === map.width * map.height
+      && map.values.every((value) => Number.isFinite(value) && value >= 0 && value <= 1);
+  }
+
+  function exampleHeatmap() {
+    // Una mancha dibujada para demostrar el visor, sin ejecución de un modelo.
+    const width = 48;
+    const height = 48;
+    const values = Array.from({ length: width * height }, (_, index) => {
+      const x = (index % width) / (width - 1);
+      const y = Math.floor(index / width) / (height - 1);
+      const center = Math.exp(-((x - 0.70) ** 2 / 0.015 + (y - 0.62) ** 2 / 0.018));
+      const edge = Math.exp(-((x - 0.79) ** 2 / 0.010 + (y - 0.70) ** 2 / 0.012));
+      return Math.min(1, 0.95 * center + 0.43 * edge);
+    });
+    return { width, height, values };
+  }
+
+  function renderHeatmap(map) {
+    // La matriz abarca toda la imagen. Conservamos la relación de aspecto del original.
+    const scale = Math.min(1, maxHeatmapSide / Math.max(selection.width, selection.height));
+    heatmapLayer.width = Math.max(1, Math.round(selection.width * scale));
+    heatmapLayer.height = Math.max(1, Math.round(selection.height * scale));
+
+    const source = document.createElement('canvas');
+    source.width = map.width;
+    source.height = map.height;
+    const sourceContext = source.getContext('2d');
+    const layerContext = heatmapLayer.getContext('2d');
+    if (!sourceContext || !layerContext) return false;
+
+    const pixels = sourceContext.createImageData(map.width, map.height);
+    map.values.forEach((value, i) => {
+      const segment = value * (heatmapColors.length - 1);
+      const first = Math.min(Math.floor(segment), heatmapColors.length - 2);
+      const fraction = segment - first;
+      for (let channel = 0; channel < 3; channel++) {
+        const from = heatmapColors[first][channel];
+        const to = heatmapColors[first + 1][channel];
+        pixels.data[i * 4 + channel] = from + (to - from) * fraction;
+      }
+      pixels.data[i * 4 + 3] = 205 * value ** 0.85;
+    });
+    sourceContext.putImageData(pixels, 0, 0);
+    layerContext.drawImage(source, 0, 0, heatmapLayer.width, heatmapLayer.height);
+    return true;
+  }
+
+  function selectView(showHeatmap) {
+    if (showHeatmap && heatmapView.disabled) return;
+    heatmapLayer.hidden = !showHeatmap;
+    heatmapLegend.hidden = !showHeatmap;
+    originalView.setAttribute('aria-pressed', String(!showHeatmap));
+    heatmapView.setAttribute('aria-pressed', String(showHeatmap));
+  }
+
+  function resetHeatmap() {
+    if (document.activeElement === heatmapView) originalView.focus();
+    heatmapView.disabled = true;
+    selectView(false);
+    showMessage(heatmapNote);
+  }
+
+  function showResultHeatmap(result, simulated) {
+    const map = simulated && selection.key === 'pneumonia' ? exampleHeatmap() : result.gradCam;
+    if (!validHeatmap(map) || !renderHeatmap(map)) {
+      resetHeatmap();
+      showMessage(heatmapNote, simulated
+        ? 'El mapa ilustrativo está disponible en el ejemplo con neumonía.'
+        : 'Mapa de influencia no disponible para este resultado.');
+      return;
+    }
+
+    const kind = simulated ? 'demo' : 'model';
+    const caption = simulated ? 'Mapa ilustrativo' : 'Influencia del modelo';
+    heatmapLayer.dataset.kind = kind;
+    heatmapLayer.setAttribute('aria-label', `${caption} sobre la radiografía`);
+    heatmapLegend.dataset.kind = kind;
+    if (heatmapCaption) heatmapCaption.textContent = caption;
+    showMessage(heatmapNote, simulated
+      ? 'El mapa es ilustrativo. Sus colores simulan la escala de influencia.'
+      : 'Grad-CAM muestra la influencia relativa de cada zona en la clase predicha.', kind);
+    heatmapView.disabled = false;
+    selectView(true);
+  }
+
   function showResult(result, simulated) {
     const scoreText = percentFormat.format(result.score);
     const modelName = typeof result.model === 'string' ? result.model.trim() : '';
@@ -221,10 +335,12 @@
     resultMeter.value = result.score * 100;
     resultMeter.setAttribute('aria-label', `Puntuación ${simulated ? 'simulada' : 'del modelo'}: ${scoreText}`);
     setResultState('output');
+    showResultHeatmap(result, simulated);
   }
 
   async function analyze() {
     if (analyzeButton.disabled || !selection) return;
+    if (mobileLayout.matches) showWorkspaceView('result', byId('result-title'));
     if (selection.result) {
       showResult(selection.result, true);
       return;
@@ -306,8 +422,17 @@
   }
 
   resetButton.addEventListener('click', clearImage);
+  mobileViewer.addEventListener('click', () => showWorkspaceView('viewer'));
+  mobileResult.addEventListener('click', () => showWorkspaceView('result'));
+  byId('result-back').addEventListener('click', () => showWorkspaceView('viewer', mobileViewer));
+  byId('open-guide').addEventListener('click', () => byId('analysis-guide').showModal());
   analyzeButton.addEventListener('click', analyze);
-  if (modeLabel && endpoint) modeLabel.textContent = 'Modelo preentrenado';
+  originalView.addEventListener('click', () => selectView(false));
+  heatmapView.addEventListener('click', () => selectView(true));
+  if (endpoint) {
+    modeLabel.textContent = 'Modelo preentrenado';
+    modeLabel.dataset.mode = 'model';
+  }
   setResultState('empty');
   updateControls();
 })();
